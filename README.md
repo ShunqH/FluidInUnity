@@ -52,8 +52,25 @@ Upto 1,000,000 particles on a RTX 4090 Laptop (125–145W).
 
 ## Demo Video
 
-YouTuBe: 
+YouTuBe: https://youtu.be/LRetKR5Byag
+
 Bilibili: https://www.bilibili.com/video/BV1vUsqzrEFk/
+
+---
+
+## Project Structure
+
+```
+  Assets/
+  ├── Shaders/ # GPU compute and rendering shaders
+  |     ├──SPHCompute.compute # Main SPH solver (density, pressure, force, integration)
+  |     ├──RenderParticles.shader # Particle rendering shader (visualization)
+  |     ├──BoxOutLine.shader # Simple box outline effect for simulation boundaries
+  └── Scripts/ # Unity C# scripts controlling the simulation
+        ├──ParticlesGPU.cs # Core simulation script (manages GPU buffers and kernel dispatch)
+        ├──BoxController.cs # Controls simulation boundary and user interaction
+        └──ParticlesCPU.cs # Legacy CPU implementation (kept for reference, not used anymore)
+```
 
 ---
 
