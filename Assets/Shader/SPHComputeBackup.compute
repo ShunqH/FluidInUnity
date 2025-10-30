@@ -1,0 +1,255 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel kernelDensity
+#pragma kernel kernelAcceleration
+#pragma kernel kernelUpdate
+
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWStructuredBuffer<float3> positions;
+RWStructuredBuffer<float3> velocities;
+RWStructuredBuffer<float3> accelerations;
+RWStructuredBuffer<float> density;
+RWStructuredBuffer<float> mass;
+StructuredBuffer<int> blockIDs;
+StructuredBuffer<int> sortedIDs;
+StructuredBuffer<int> blockStart;
+// RWStructuredBuffer<float> debug;
+
+cbuffer SimulationParams : register(b0)
+{
+    float dt; 
+    int dispatchX; 
+    int particleCount; 
+    float3 gravityVector; 
+    float maxSpeed; 
+    float CollisionDamping; 
+    float ShearDamping; 
+    float smoothLength; 
+    float density0; 
+    float soundSpeed; 
+    float alpha; 
+    float beta; 
+    float xmin;
+    float xmax;
+    float ymin;
+    float ymax;
+    float zmin;
+    float zmax;
+    int blockOffset[27]; 
+    int nBlocks; 
+}
+
+#define THREADS_PER_GROUP_X 256
+#define PI 3.1415926535
+
+// M4 cubic spline kernel (weight function for density)
+float WM4(float q, float h)
+{
+    float result = 1 / PI;
+    if (q >= 0 && q < 1)
+    {
+        result *= 1 - 1.5 * q * q + 0.75 * q * q * q;
+    }
+    else if (q >= 1 && q < 2)
+    {
+        result *= 0.25 * (2 - q) * (2 - q) * (2 - q);
+    }
+    else
+    {
+        result = 0;
+    }
+    return result / (h * h * h);
+}
+
+// gradient for M4 kernel (for pressure/force)
+// dWM4dq = (dW/dq)/smoothLength,
+// dq/dr = (r_ab / |r_ab|) / smoothLength,
+// div(W) = (dW/dq)*(dq/dr) = dWM4dq * (r_ab / |r_ab|)
+float dWM4dq(float dist, float h)
+{
+    float result = 1 / PI;
+    float q = dist / h;
+    if (q >= 0 && q < 1)
+    {
+        result *= -3 * q + 3 * 0.75 * q * q;
+    }
+    else if (q >= 1 && q < 2)
+    {
+        result *= -0.75 * (2 - q) * (2 - q);
+    }
+    else
+    {
+        result = 0;
+    }
+    return result / (h * h * h * h);
+}
+
+// density calculations
+void getDensity(uint ia)
+{
+    float dens = 0;
+    int blockIndex = 0;
+    for (int ioffset = 0; ioffset < 27; ioffset++)
+    {
+        blockIndex = blockIDs[ia] + blockOffset[ioffset];
+        if (blockIndex < 0 || blockIndex >= nBlocks)
+            continue;
+        for (int n = blockStart[blockIndex]; n < blockStart[blockIndex + 1]; n++)
+        {
+            int ib = sortedIDs[n];
+            float q = length(positions[ia] - positions[ib]) / smoothLength;
+            dens += mass[ib] * WM4(q, smoothLength);
+        }
+    }
+    density[ia] = dens;
+}
+
+// force and acceleration calculation
+void getAcceleration(uint ia)
+{
+    float3 acc = 0;
+    int blockIndex = 0;
+    for (int ioffset = 0; ioffset < 27; ioffset++)
+    {
+        blockIndex = blockIDs[ia] + blockOffset[ioffset];
+        if (blockIndex < 0 || blockIndex >= nBlocks)
+            continue;
+        for (int n = blockStart[blockIndex]; n < blockStart[blockIndex + 1]; n++)
+        {
+            uint ib = sortedIDs[n];
+            if (ia == ib)
+            {
+                continue;
+            }
+            float wh = 0;
+            float coeffViscosity = 0;
+            float disAB = length(positions[ia] - positions[ib]);
+            float invDisAB = 1.0 / (disAB + 1e-8);
+            float3 vr = positions[ia] - positions[ib];
+            float3 vv = velocities[ia] - velocities[ib];
+            float vdotr = dot(vr, vv) * invDisAB;
+
+            //viscosity terms
+            if (vdotr < 0)
+            {
+                coeffViscosity = -0.5f * (alpha * soundSpeed - beta * vdotr) * vdotr;
+            }
+            wh = dWM4dq(disAB, smoothLength); // div(W) = (dW/dq)*(dq/dr) = wh * (r_ab / |r_ab|)
+
+            /* Normal Compressable SPH formular */
+            float term = ( (1 / density[ia]) + (1 / density[ib]) )
+                        *( soundSpeed * soundSpeed + coeffViscosity ) * wh;
+            /* End Normal Compressable SPH formular */
+
+            /* Fix density SPH formular */
+            // float term =              ( (1 / density[ia]) + (1 / density[ib]) )
+            //              - density0 * ( (1 / (density[ia] * density[ia]) ) 
+            //                           + (1 / (density[ib] * density[ib]) ) );
+            // term *= (soundSpeed * soundSpeed + coeffViscosity) * wh;
+            /* End Fix density SPH formular */
+
+            term = -mass[ib] * term * invDisAB;
+            acc += term * vr;
+        }
+    }
+    accelerations[ia] = acc + gravityVector;
+}
+
+void updateParticles(uint ia)
+{
+    float3 vel = velocities[ia] + accelerations[ia] * dt;
+    float vmag = length(vel);
+    if (vmag > maxSpeed)
+        vel = vel * maxSpeed / (vmag + 1e-8);
+    float3 pos = positions[ia] + vel * dt;
+        
+    if (pos.x < xmin)
+    {
+        pos.x = xmin;
+        vel.x *= -1 * CollisionDamping;
+        vel.y *= ShearDamping;
+        vel.z *= ShearDamping;
+    }
+    else if (pos.x > xmax)
+    {
+        pos.x = xmax;
+        vel.x *= -1 * CollisionDamping;
+        vel.y *= ShearDamping;
+        vel.z *= ShearDamping;
+    }
+    if (pos.y < ymin)
+    {
+        pos.y = ymin;
+        vel.y *= -1 * CollisionDamping;
+        vel.x *= ShearDamping;
+        vel.z *= ShearDamping;
+    }
+    else if (pos.y > ymax)
+    {
+        pos.y = ymax;
+        vel.y *= -1 * CollisionDamping;
+        vel.x *= ShearDamping;
+        vel.z *= ShearDamping;
+    }
+    if (pos.z < zmin)
+    {
+        pos.z = zmin;
+        vel.z *= -1 * CollisionDamping;
+        vel.x *= ShearDamping;
+        vel.y *= ShearDamping;
+    }
+    else if (pos.z > zmax)
+    {
+        pos.z = zmax;
+        vel.z *= -1 * CollisionDamping;
+        vel.x *= ShearDamping;
+        vel.y *= ShearDamping;
+    }
+    velocities[ia] = vel;
+    positions[ia] = pos;
+}
+
+[numthreads(THREADS_PER_GROUP_X, 1, 1)]
+void kernelUpdate(uint3 id : SV_DispatchThreadID)
+{
+    // TODO: insert actual code here!
+    uint totalThreads = THREADS_PER_GROUP_X * dispatchX;
+
+    for (uint ia = id.x; ia < (uint) particleCount; ia += totalThreads)
+    {
+        // if (ia >= particleCount) break;
+        updateParticles(ia);
+        // if (ia == 0)
+        // {
+        //     debug[0] = (float) nBlocks;
+        // }
+    }
+        
+}
+
+[numthreads(THREADS_PER_GROUP_X, 1, 1)]
+void kernelDensity(uint3 id : SV_DispatchThreadID)
+{
+    uint totalThreads = THREADS_PER_GROUP_X * dispatchX;
+
+    for (uint ia = id.x; ia < (uint) particleCount; ia += totalThreads)
+    {
+        // if (ia >= particleCount) break;
+        getDensity(ia);
+    }
+        
+}
+
+[numthreads(THREADS_PER_GROUP_X, 1, 1)]
+void kernelAcceleration(uint3 id : SV_DispatchThreadID)
+{
+    // TODO: insert actual code here!
+    uint totalThreads = THREADS_PER_GROUP_X * dispatchX;
+
+    for (uint ia = id.x; ia < (uint) particleCount; ia += totalThreads)
+    {
+        getAcceleration(ia);
+    }
+        
+}
